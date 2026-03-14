@@ -14,8 +14,8 @@
 # Usage:
 #   mcp-reconnect                          # All local Claude sessions
 #   mcp-reconnect weaver claude            # Specific sessions by name
-#   mcp-reconnect --remote spark2          # All Claude sessions on remote host
-#   mcp-reconnect --remote spark2 weaver   # Specific session on remote host
+#   mcp-reconnect --remote devbox          # All Claude sessions on remote host
+#   mcp-reconnect --remote devbox weaver   # Specific session on remote host
 #   mcp-reconnect --delay 10               # Wait N seconds before starting (detached use)
 #
 # Requirements:
