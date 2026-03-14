@@ -103,9 +103,9 @@ No other dependencies. No Redis, no Python, no Node.js.
 
 These constraints were discovered through extensive production testing:
 
-### Sequential execution
+### Parallel local, sequential remote
 
-Sessions are reconnected one at a time. Parallel reconnect (`&` + `wait`) causes race conditions where multiple instances of the script inject keystrokes into each other's sessions, producing `/mcp/mcp` double-typing or killing sessions outright.
+Local sessions run in parallel — each targets a different tmux pane, so there's no contention. Remote sessions run sequentially over SSH to avoid connection multiplexing issues.
 
 ### Conservative settle times
 
@@ -113,7 +113,7 @@ The default timings (5s after Escape, 2s after `/mcp`, 5s after Reconnect) are d
 
 ### Stale process cleanup
 
-Consecutive deploys can spawn duplicate reconnect scripts. The script kills any prior instances of itself (`pgrep -f mcp-reconnect`) on startup to prevent keystroke collisions.
+Consecutive deploys can spawn duplicate reconnect scripts. The script kills prior instances on startup to prevent keystroke collisions. The cleanup logic excludes its own PID and parent PID to avoid killing the calling shell (a subtle bug discovered during testing — `pgrep -f` matches any process whose command line contains the script name, including the parent shell).
 
 ### Detached execution
 
@@ -167,6 +167,27 @@ done
 ### Claude Code hook (plugin)
 
 When installed as a plugin, `mcp-reconnect` includes a notification hook that detects MCP disconnection events and prompts Claude to reconnect.
+
+## Testing
+
+The repo includes an integration test suite that runs against real tmux:
+
+```bash
+bash test/integration-test.sh
+```
+
+Tests cover:
+- Session detection (finds Claude sessions, ignores others)
+- Key sequence injection (verifies `/mcp` and continuation arrive in pane)
+- Key sequence order (`/mcp` before continuation message)
+- Parallel multi-session reconnect
+- Session targeting (only named session gets keys, bystanders untouched)
+- `--delay` flag timing
+- Clean exit when no sessions found
+
+The test suite uses `exec -a claude sleep 300` to create tmux panes where `pane_current_command` reports `"claude"` — the same detection mechanism the real script uses.
+
+A mock-based unit test suite is also available at `test/run-tests.sh` for environments without tmux.
 
 ## License
 
