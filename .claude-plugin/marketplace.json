@@ -1,0 +1,24 @@
+{
+  "name": "mcp-reconnect",
+  "owner": {
+    "name": "PALIOS-TAEY",
+    "email": "jesse@taey.ai"
+  },
+  "metadata": {
+    "description": "Automated MCP server reconnection for Claude Code tmux sessions",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "mcp-reconnect",
+      "source": "./",
+      "description": "Reconnect MCP servers in Claude Code tmux sessions via automated key injection. Supports local and remote hosts, sequential session handling, and detached execution.",
+      "version": "1.0.0",
+      "category": "devops",
+      "tags": ["mcp", "reconnect", "tmux", "deploy", "automation"],
+      "author": {
+        "name": "PALIOS-TAEY"
+      }
+    }
+  ]
+}
