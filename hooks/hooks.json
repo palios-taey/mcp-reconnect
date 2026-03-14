@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": "MCP.*disconnect|MCP.*error|MCP.*failed",
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "MCP server disconnection detected. You can reconnect by running: `mcp-reconnect` (if installed to PATH) or by using the /mcp menu manually. If running inside a tmux session, the mcp-reconnect plugin can automate this."
+          }
+        ]
+      }
+    ]
+  }
+}
