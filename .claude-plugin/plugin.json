@@ -1,0 +1,13 @@
+{
+  "name": "mcp-reconnect",
+  "version": "1.0.0",
+  "description": "Reconnect MCP servers in Claude Code tmux sessions via automated key injection. No API required — works by driving the /mcp interactive menu through tmux send-keys.",
+  "author": {
+    "name": "PALIOS-TAEY",
+    "url": "https://github.com/palios-taey"
+  },
+  "homepage": "https://github.com/palios-taey/mcp-reconnect",
+  "repository": "https://github.com/palios-taey/mcp-reconnect",
+  "license": "MIT",
+  "keywords": ["mcp", "reconnect", "tmux", "automation", "devops"]
+}
