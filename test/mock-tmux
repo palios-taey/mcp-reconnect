@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Mock tmux for testing mcp-reconnect.
+#
+# Records all tmux commands to $MOCK_TMUX_LOG (one JSON line per call).
+# Simulates session listing and pane command detection based on
+# $MOCK_TMUX_SESSIONS (format: "session1=claude,session2=vim,session3=claude").
+
+MOCK_TMUX_LOG="${MOCK_TMUX_LOG:-/tmp/mock-tmux.log}"
+MOCK_TMUX_SESSIONS="${MOCK_TMUX_SESSIONS:-}"
+
+# Log the raw call
+log_call() {
+    local timestamp
+    timestamp=$(date +%s%N 2>/dev/null || date +%s)
+    echo "{\"ts\":\"$timestamp\",\"args\":[$(printf '"%s",' "$@" | sed 's/,$//')]}" >> "$MOCK_TMUX_LOG"
+}
+
+log_call "$@"
+
+# Route subcommands
+case "${1:-}" in
+    list-sessions)
+        # Parse MOCK_TMUX_SESSIONS and output session names
+        if [ -z "$MOCK_TMUX_SESSIONS" ]; then
+            # Simulate "no server running" (tmux exits 1 with no sessions)
+            exit 1
+        fi
+        IFS=',' read -ra PAIRS <<< "$MOCK_TMUX_SESSIONS"
+        for pair in "${PAIRS[@]}"; do
+            session="${pair%%=*}"
+            echo "$session"
+        done
+        ;;
+
+    display-message)
+        # Extract session name from -t flag, return its mock command
+        local_session=""
+        for ((i=1; i<$#; i++)); do
+            arg="${!i}"
+            if [ "$arg" = "-t" ]; then
+                next=$((i+1))
+                local_session="${!next}"
+                break
+            fi
+        done
+
+        if [ -z "$local_session" ]; then
+            echo "unknown"
+            exit 0
+        fi
+
+        # Look up the pane command for this session
+        IFS=',' read -ra PAIRS <<< "$MOCK_TMUX_SESSIONS"
+        for pair in "${PAIRS[@]}"; do
+            session="${pair%%=*}"
+            cmd="${pair#*=}"
+            if [ "$session" = "$local_session" ]; then
+                echo "$cmd"
+                exit 0
+            fi
+        done
+        echo "bash"  # default: not claude
+        ;;
+
+    send-keys)
+        # Just log it (already done above). No-op.
+        ;;
+
+    *)
+        # Unknown subcommand — log and succeed
+        ;;
+esac
+
+exit 0
