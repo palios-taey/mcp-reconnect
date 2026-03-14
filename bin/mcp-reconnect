@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# mcp-reconnect — Reconnect MCP servers in Claude Code tmux sessions via key injection.
+#
+# Claude Code has no programmatic API for MCP reconnect. The only way is through
+# the interactive /mcp menu. This script automates that sequence via tmux send-keys.
+#
+# Key sequence:
+#   Escape        → stop any active generation
+#   /mcp + Enter  → open the /mcp slash command menu
+#   Enter         → enter the menu
+#   Down + Enter  → select "Reconnect" (2nd option)
+#   <prompt>      → continuation message so Claude resumes work
+#
+# Usage:
+#   mcp-reconnect                          # All local Claude sessions
+#   mcp-reconnect weaver claude            # Specific sessions by name
+#   mcp-reconnect --remote spark2          # All Claude sessions on remote host
+#   mcp-reconnect --remote spark2 weaver   # Specific session on remote host
+#   mcp-reconnect --delay 10               # Wait N seconds before starting (detached use)
+#
+# Requirements:
+#   - tmux (Claude Code sessions must be running inside tmux)
+#   - ssh (for --remote, with key-based auth configured)
+#
+# Design notes (learned the hard way):
+#   - Sessions are reconnected SEQUENTIALLY. Parallel reconnect causes /mcp/mcp
+#     double-typing and race conditions that kill sibling sessions.
+#   - When called from within a Claude Code session (e.g., a deploy hook), use
+#     --delay with nohup/disown so the calling session's bash tool returns before
+#     Escape hits: nohup mcp-reconnect --delay 10 &>/dev/null & disown
+#   - Settle times are conservative. Shorter waits cause missed keystrokes.
+
+set -euo pipefail
+
+# --- Configuration -----------------------------------------------------------
+
+SETTLE_AFTER_ESC=5        # Seconds after Escape (let generation stop)
+SETTLE_AFTER_MCP=2        # Seconds after /mcp submit (menu render time)
+SETTLE_AFTER_SELECT=5     # Seconds after selecting Reconnect
+DELAY=0                   # Pre-start delay (--delay flag)
+CONTINUATION_MSG="MCP servers were just reconnected with latest code. Resume where you left off."
+
+# --- Functions ---------------------------------------------------------------
+
+usage() {
+    cat <<'EOF'
+Usage: mcp-reconnect [OPTIONS] [SESSION...]
+
+Reconnect MCP servers in Claude Code tmux sessions.
+
+Arguments:
+  SESSION...              Specific tmux session names (default: auto-detect all)
+
+Options:
+  --remote HOST           Reconnect sessions on a remote machine via SSH
+  --delay SECONDS         Wait before starting (for detached/nohup use cases)
+  --settle-esc SECONDS    Override post-Escape settle time (default: 5)
+  --settle-mcp SECONDS    Override post-/mcp settle time (default: 2)
+  --settle-select SECONDS Override post-Reconnect settle time (default: 5)
+  --message MSG           Override the continuation prompt sent after reconnect
+  --dry-run               Show what would be done without sending keys
+  --help                  Show this help message
+
+Examples:
+  mcp-reconnect                              # Auto-detect and reconnect all
+  mcp-reconnect --remote myserver            # Reconnect on remote host
+  mcp-reconnect --delay 10                   # Delayed start (nohup use case)
+  mcp-reconnect --dry-run                    # Preview without executing
+EOF
+    exit 0
+}
+
+die() { echo "[mcp-reconnect] ERROR: $*" >&2; exit 1; }
+
+# Kill any prior instances of this script (prevents duplicate reconnect storms)
+kill_stale() {
+    local own_pid=$$
+    local stale_pids
+    stale_pids=$(pgrep -f 'mcp-reconnect' 2>/dev/null | grep -v "^${own_pid}$" || true)
+    if [ -n "$stale_pids" ]; then
+        echo "[mcp-reconnect] Killing stale instances: $stale_pids"
+        echo "$stale_pids" | xargs kill 2>/dev/null || true
+    fi
+}
+
+get_claude_sessions() {
+    local sessions=()
+    local session_list
+    session_list=$(tmux list-sessions -F '#{session_name}' 2>/dev/null) || return 0
+    while IFS= read -r session; do
+        [ -z "$session" ] && continue
+        local cmd
+        cmd=$(tmux display-message -t "$session" -p '#{pane_current_command}' 2>/dev/null || echo "")
+        if [ "$cmd" = "claude" ]; then
+            sessions+=("$session")
+        fi
+    done <<< "$session_list"
+    printf '%s\n' "${sessions[@]}"
+}
+
+reconnect_session() {
+    local session="$1"
+
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        echo "[mcp-reconnect] DRY RUN: would reconnect session '$session'"
+        return 0
+    fi
+
+    echo "[mcp-reconnect] $session: sending Escape..."
+    tmux send-keys -t "$session" Escape
+    sleep "$SETTLE_AFTER_ESC"
+
+    echo "[mcp-reconnect] $session: sending /mcp..."
+    tmux send-keys -t "$session" -l "/mcp"
+    sleep 0.3
+    tmux send-keys -t "$session" Enter
+    sleep "$SETTLE_AFTER_MCP"
+
+    echo "[mcp-reconnect] $session: entering menu..."
+    tmux send-keys -t "$session" Enter
+    sleep 0.3
+
+    echo "[mcp-reconnect] $session: selecting Reconnect..."
+    tmux send-keys -t "$session" Down
+    sleep 0.2
+    tmux send-keys -t "$session" Enter
+    sleep "$SETTLE_AFTER_SELECT"
+
+    echo "[mcp-reconnect] $session: sending continuation prompt..."
+    tmux send-keys -t "$session" -l "$CONTINUATION_MSG"
+    sleep 0.3
+    tmux send-keys -t "$session" Enter
+
+    echo "[mcp-reconnect] $session: done"
+}
+
+reconnect_remote() {
+    local host="$1"
+    shift
+    local sessions=("$@")
+
+    echo "[mcp-reconnect] Remote target: $host"
+
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        echo "[mcp-reconnect] DRY RUN: would reconnect on remote host '$host'"
+        return 0
+    fi
+
+    # If no specific sessions requested, auto-detect on remote
+    if [ ${#sessions[@]} -eq 0 ]; then
+        local remote_sessions
+        remote_sessions=$(ssh -o ConnectTimeout=5 "$host" bash -c '
+            for s in $(tmux list-sessions -F "#{session_name}" 2>/dev/null); do
+                cmd=$(tmux display-message -t "$s" -p "#{pane_current_command}" 2>/dev/null || echo "")
+                [ "$cmd" = "claude" ] && echo "$s"
+            done
+        ' 2>/dev/null) || die "SSH connection to $host failed"
+
+        if [ -z "$remote_sessions" ]; then
+            echo "[mcp-reconnect] $host: no Claude sessions found"
+            return 0
+        fi
+        mapfile -t sessions <<< "$remote_sessions"
+    fi
+
+    # Reconnect each session sequentially on remote
+    for session in "${sessions[@]}"; do
+        [ -z "$session" ] && continue
+        echo "[mcp-reconnect] $host/$session: reconnecting..."
+        ssh -o ConnectTimeout=5 "$host" bash -s -- "$session" \
+            "$SETTLE_AFTER_ESC" "$SETTLE_AFTER_MCP" "$SETTLE_AFTER_SELECT" \
+            "$CONTINUATION_MSG" <<'RECONNECT_EOF'
+SESSION="$1"; T_ESC="$2"; T_MCP="$3"; T_SEL="$4"; MSG="$5"
+tmux send-keys -t "$SESSION" Escape
+sleep "$T_ESC"
+tmux send-keys -t "$SESSION" -l "/mcp"
+sleep 0.3
+tmux send-keys -t "$SESSION" Enter
+sleep "$T_MCP"
+tmux send-keys -t "$SESSION" Enter
+sleep 0.3
+tmux send-keys -t "$SESSION" Down
+sleep 0.2
+tmux send-keys -t "$SESSION" Enter
+sleep "$T_SEL"
+tmux send-keys -t "$SESSION" -l "$MSG"
+sleep 0.3
+tmux send-keys -t "$SESSION" Enter
+echo "[mcp-reconnect] $SESSION: done"
+RECONNECT_EOF
+    done
+}
+
+# --- Argument Parsing --------------------------------------------------------
+
+DRY_RUN=0
+REMOTE_HOST=""
+POSITIONAL=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --help|-h)          usage ;;
+        --remote)           REMOTE_HOST="${2:?--remote requires a hostname}"; shift 2 ;;
+        --delay)            DELAY="${2:?--delay requires a number}"; shift 2 ;;
+        --settle-esc)       SETTLE_AFTER_ESC="${2:?--settle-esc requires a number}"; shift 2 ;;
+        --settle-mcp)       SETTLE_AFTER_MCP="${2:?--settle-mcp requires a number}"; shift 2 ;;
+        --settle-select)    SETTLE_AFTER_SELECT="${2:?--settle-select requires a number}"; shift 2 ;;
+        --message)          CONTINUATION_MSG="${2:?--message requires text}"; shift 2 ;;
+        --dry-run)          DRY_RUN=1; shift ;;
+        -*)                 die "Unknown option: $1" ;;
+        *)                  POSITIONAL+=("$1"); shift ;;
+    esac
+done
+
+# --- Main --------------------------------------------------------------------
+
+# Kill stale instances from prior runs
+kill_stale
+
+# Pre-start delay (for nohup/detached use case)
+if [ "$DELAY" -gt 0 ] 2>/dev/null; then
+    echo "[mcp-reconnect] Waiting ${DELAY}s before starting..."
+    sleep "$DELAY"
+fi
+
+# Remote mode
+if [ -n "$REMOTE_HOST" ]; then
+    reconnect_remote "$REMOTE_HOST" "${POSITIONAL[@]}"
+    exit 0
+fi
+
+# Local mode
+if [ ${#POSITIONAL[@]} -gt 0 ]; then
+    SESSIONS=("${POSITIONAL[@]}")
+else
+    mapfile -t SESSIONS < <(get_claude_sessions)
+fi
+
+if [ ${#SESSIONS[@]} -eq 0 ]; then
+    echo "[mcp-reconnect] No Claude Code sessions found in tmux"
+    exit 0
+fi
+
+echo "[mcp-reconnect] Found ${#SESSIONS[@]} session(s): ${SESSIONS[*]}"
+
+# Sequential — parallel causes race conditions
+for session in "${SESSIONS[@]}"; do
+    [ -z "$session" ] && continue
+    reconnect_session "$session"
+done
+
+echo "[mcp-reconnect] All sessions reconnected"
