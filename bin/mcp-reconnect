@@ -57,6 +57,8 @@ Options:
   --settle-esc SECONDS    Override post-Escape settle time (default: 5)
   --settle-mcp SECONDS    Override post-/mcp settle time (default: 2)
   --settle-select SECONDS Override post-Reconnect settle time (default: 5)
+  --server NAME           Target a specific MCP server by name (uses cursor tracking)
+  --exclude SESSION       Skip this tmux session (for caller exclusion)
   --message MSG           Override the continuation prompt sent after reconnect
   --dry-run               Show what would be done without sending keys
   --help                  Show this help message
@@ -108,6 +110,7 @@ get_claude_sessions() {
 
 reconnect_session() {
     local session="$1"
+    local target_server="${TARGET_SERVER:-}"
 
     if [ "${DRY_RUN:-0}" = "1" ]; then
         echo "[mcp-reconnect] DRY RUN: would reconnect session '$session'"
@@ -122,14 +125,74 @@ reconnect_session() {
     tmux send-keys -t "$session" -l "/mcp"
     sleep 0.3
     tmux send-keys -t "$session" Enter
-    sleep "$SETTLE_AFTER_MCP"
 
-    echo "[mcp-reconnect] $session: Enter (menu) → Down → Enter (reconnect)..."
-    tmux send-keys -t "$session" Enter
-    sleep 0.5
-    tmux send-keys -t "$session" Down
-    sleep 0.3
-    tmux send-keys -t "$session" Enter
+    # Wait for menu to render (look for navigation hint text)
+    local menu_ready=0
+    for attempt in 1 2 3 4 5; do
+        local screen
+        screen=$(tmux capture-pane -t "$session" -p 2>/dev/null)
+        if echo "$screen" | grep -q "to navigate"; then
+            menu_ready=1
+            break
+        fi
+        sleep 1
+    done
+
+    if [ $menu_ready -eq 0 ]; then
+        echo "[mcp-reconnect] $session: WARNING — /mcp menu didn't render"
+        tmux send-keys -t "$session" Escape
+        return 1
+    fi
+
+    # Navigate to the target server if specified, otherwise use first option
+    if [ -n "$target_server" ]; then
+        # Extract menu region (between "Manage MCP" header and "to navigate" footer)
+        # Then press Down until cursor (❯) is on a line with the target server name
+        # and the · separator (prevents matching section headers containing the name)
+        local found=0
+        for attempt in $(seq 0 14); do
+            local menu
+            menu=$(tmux capture-pane -t "$session" -p 2>/dev/null | sed -n '/Manage MCP/,/to navigate/p')
+            if echo "$menu" | grep '❯' | grep ' · ' | grep -qi "$target_server"; then
+                echo "[mcp-reconnect] $session: cursor on '$target_server' (attempt $attempt)"
+                found=1
+                break
+            fi
+            tmux send-keys -t "$session" Down
+            sleep 0.3
+        done
+
+        if [ $found -eq 1 ]; then
+            tmux send-keys -t "$session" Enter
+            sleep 2
+            # Navigate to Reconnect in submenu (use tail of screen, not full pane)
+            for attempt in $(seq 0 9); do
+                local submenu
+                submenu=$(tmux capture-pane -t "$session" -p 2>/dev/null | tail -20)
+                if echo "$submenu" | grep '❯' | grep -qi "Reconnect"; then
+                    break
+                fi
+                tmux send-keys -t "$session" Down
+                sleep 0.3
+            done
+            tmux send-keys -t "$session" Enter
+        else
+            echo "[mcp-reconnect] $session: '$target_server' not found — pressing Enter on default"
+            tmux send-keys -t "$session" Enter
+            sleep 0.5
+            tmux send-keys -t "$session" Down
+            sleep 0.3
+            tmux send-keys -t "$session" Enter
+        fi
+    else
+        # Legacy behavior: Enter → Down → Enter
+        tmux send-keys -t "$session" Enter
+        sleep 0.5
+        tmux send-keys -t "$session" Down
+        sleep 0.3
+        tmux send-keys -t "$session" Enter
+    fi
+
     sleep "$SETTLE_AFTER_SELECT"
 
     echo "[mcp-reconnect] $session: sending continuation prompt..."
@@ -201,6 +264,8 @@ RECONNECT_EOF
 
 DRY_RUN=0
 REMOTE_HOST=""
+TARGET_SERVER=""
+EXCLUDE_SESSION=""
 POSITIONAL=()
 
 while [ $# -gt 0 ]; do
@@ -212,11 +277,15 @@ while [ $# -gt 0 ]; do
         --settle-mcp)       SETTLE_AFTER_MCP="${2:?--settle-mcp requires a number}"; shift 2 ;;
         --settle-select)    SETTLE_AFTER_SELECT="${2:?--settle-select requires a number}"; shift 2 ;;
         --message)          CONTINUATION_MSG="${2:?--message requires text}"; shift 2 ;;
+        --server)           TARGET_SERVER="${2:?--server requires a server name}"; shift 2 ;;
+        --exclude)          EXCLUDE_SESSION="${2:?--exclude requires a session name}"; shift 2 ;;
         --dry-run)          DRY_RUN=1; shift ;;
         -*)                 die "Unknown option: $1" ;;
         *)                  POSITIONAL+=("$1"); shift ;;
     esac
 done
+
+export TARGET_SERVER
 
 # --- Main --------------------------------------------------------------------
 
@@ -240,6 +309,19 @@ if [ ${#POSITIONAL[@]} -gt 0 ]; then
     SESSIONS=("${POSITIONAL[@]}")
 else
     mapfile -t SESSIONS < <(get_claude_sessions)
+fi
+
+# Filter out excluded session (e.g., the caller)
+if [ -n "$EXCLUDE_SESSION" ] && [ ${#SESSIONS[@]} -gt 0 ]; then
+    FILTERED=()
+    for s in "${SESSIONS[@]}"; do
+        if [ "$s" != "$EXCLUDE_SESSION" ]; then
+            FILTERED+=("$s")
+        else
+            echo "[mcp-reconnect] Excluding session '$s' (caller)"
+        fi
+    done
+    SESSIONS=("${FILTERED[@]}")
 fi
 
 if [ ${#SESSIONS[@]} -eq 0 ]; then
