@@ -193,9 +193,19 @@ reconnect_session() {
         tmux send-keys -t "$session" Enter
     fi
 
-    sleep "$SETTLE_AFTER_SELECT"
+    # Wait for actual reconnection signal in pane output
+    echo "[mcp-reconnect] $session: waiting for reconnection signal..."
+    for _w in $(seq 1 30); do
+        if tmux capture-pane -t "$session" -p 2>/dev/null | grep -q "Reconnected to"; then
+            echo "[mcp-reconnect] $session: reconnection confirmed"
+            break
+        fi
+        sleep 1
+    done
 
     echo "[mcp-reconnect] $session: sending continuation prompt..."
+    tmux send-keys -t "$session" C-a C-k
+    sleep 0.2
     tmux send-keys -t "$session" -l "$CONTINUATION_MSG"
     sleep 0.3
     tmux send-keys -t "$session" Enter
