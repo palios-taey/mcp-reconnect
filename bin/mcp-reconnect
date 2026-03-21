@@ -68,6 +68,8 @@ Examples:
   mcp-reconnect --remote myserver            # Reconnect on remote host
   mcp-reconnect --delay 10                   # Delayed start (nohup use case)
   mcp-reconnect --dry-run                    # Preview without executing
+  mcp-reconnect --server taeys-hands         # Reconnect specific MCP server
+  mcp-reconnect --exclude caller-session     # Skip the calling session
 EOF
     exit 0
 }
@@ -108,6 +110,58 @@ get_claude_sessions() {
     [ ${#sessions[@]} -gt 0 ] && printf '%s\n' "${sessions[@]}"
 }
 
+# Wait for /mcp menu to render. Returns 0 if detected, 1 if timeout.
+# This is a soft check — callers should fall through to timing-based approach on failure.
+wait_for_menu() {
+    local session="$1"
+    local max_wait="${2:-5}"
+    for attempt in $(seq 1 "$max_wait"); do
+        local screen
+        screen=$(tmux capture-pane -t "$session" -p 2>/dev/null || true)
+        # Check for known menu indicators across Claude Code versions
+        if echo "$screen" | grep -qE "to navigate|Manage MCP|MCP Servers"; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# Navigate to a specific server in the /mcp menu using cursor tracking.
+# Returns 0 if server found and selected, 1 if not found.
+navigate_to_server() {
+    local session="$1"
+    local target_server="$2"
+
+    for attempt in $(seq 0 14); do
+        local menu
+        menu=$(tmux capture-pane -t "$session" -p 2>/dev/null | sed -n '/Manage MCP\|MCP Servers/,/to navigate\|esc to/p')
+        # Look for cursor on a line containing the target server name + separator
+        if echo "$menu" | grep '❯' | grep -E ' · |─' | grep -qi "$target_server"; then
+            echo "[mcp-reconnect] $session: cursor on '$target_server' (attempt $attempt)"
+            return 0
+        fi
+        tmux send-keys -t "$session" Down
+        sleep 0.3
+    done
+    return 1
+}
+
+# Navigate to "Reconnect" in a server's submenu.
+navigate_to_reconnect() {
+    local session="$1"
+    for attempt in $(seq 0 9); do
+        local submenu
+        submenu=$(tmux capture-pane -t "$session" -p 2>/dev/null | tail -20)
+        if echo "$submenu" | grep '❯' | grep -qi "Reconnect"; then
+            return 0
+        fi
+        tmux send-keys -t "$session" Down
+        sleep 0.3
+    done
+    return 1
+}
+
 reconnect_session() {
     local session="$1"
     local target_server="${TARGET_SERVER:-}"
@@ -117,67 +171,38 @@ reconnect_session() {
         return 0
     fi
 
+    # Step 1: Escape — stop any active generation
     echo "[mcp-reconnect] $session: sending Escape..."
     tmux send-keys -t "$session" Escape
     sleep "$SETTLE_AFTER_ESC"
 
+    # Step 2: /mcp + Enter — open the MCP menu
     echo "[mcp-reconnect] $session: sending /mcp + Enter..."
     tmux send-keys -t "$session" -l "/mcp"
     sleep 0.3
     tmux send-keys -t "$session" Enter
 
-    # Wait for menu to render (look for navigation hint text)
-    local menu_ready=0
-    for attempt in 1 2 3 4 5; do
-        local screen
-        screen=$(tmux capture-pane -t "$session" -p 2>/dev/null)
-        if echo "$screen" | grep -q "to navigate"; then
-            menu_ready=1
-            break
-        fi
-        sleep 1
-    done
-
-    if [ $menu_ready -eq 0 ]; then
-        echo "[mcp-reconnect] $session: WARNING — /mcp menu didn't render"
-        tmux send-keys -t "$session" Escape
-        return 1
+    # Step 3: Wait for menu to render (soft check — fall through on timeout)
+    local menu_detected=0
+    if wait_for_menu "$session" 5; then
+        menu_detected=1
+        echo "[mcp-reconnect] $session: menu detected"
+    else
+        echo "[mcp-reconnect] $session: menu detection timeout — using timing-based fallback"
+        sleep "$SETTLE_AFTER_MCP"
     fi
 
-    # Navigate to the target server if specified, otherwise use first option
-    if [ -n "$target_server" ]; then
-        # Extract menu region (between "Manage MCP" header and "to navigate" footer)
-        # Then press Down until cursor (❯) is on a line with the target server name
-        # and the · separator (prevents matching section headers containing the name)
-        local found=0
-        for attempt in $(seq 0 14); do
-            local menu
-            menu=$(tmux capture-pane -t "$session" -p 2>/dev/null | sed -n '/Manage MCP/,/to navigate/p')
-            if echo "$menu" | grep '❯' | grep ' · ' | grep -qi "$target_server"; then
-                echo "[mcp-reconnect] $session: cursor on '$target_server' (attempt $attempt)"
-                found=1
-                break
-            fi
-            tmux send-keys -t "$session" Down
-            sleep 0.3
-        done
-
-        if [ $found -eq 1 ]; then
+    # Step 4: Navigate and select Reconnect
+    if [ -n "$target_server" ] && [ $menu_detected -eq 1 ]; then
+        # Smart targeting: find the specific server, enter its submenu, select Reconnect
+        if navigate_to_server "$session" "$target_server"; then
             tmux send-keys -t "$session" Enter
             sleep 2
-            # Navigate to Reconnect in submenu (use tail of screen, not full pane)
-            for attempt in $(seq 0 9); do
-                local submenu
-                submenu=$(tmux capture-pane -t "$session" -p 2>/dev/null | tail -20)
-                if echo "$submenu" | grep '❯' | grep -qi "Reconnect"; then
-                    break
-                fi
-                tmux send-keys -t "$session" Down
-                sleep 0.3
-            done
+            navigate_to_reconnect "$session"
             tmux send-keys -t "$session" Enter
         else
-            echo "[mcp-reconnect] $session: '$target_server' not found — pressing Enter on default"
+            echo "[mcp-reconnect] $session: '$target_server' not found — falling back to default"
+            # Fall through to default behavior
             tmux send-keys -t "$session" Enter
             sleep 0.5
             tmux send-keys -t "$session" Down
@@ -185,7 +210,8 @@ reconnect_session() {
             tmux send-keys -t "$session" Enter
         fi
     else
-        # Legacy behavior: Enter → Down → Enter
+        # Default behavior (v1.1.0 proven pattern): Enter → Down → Enter
+        echo "[mcp-reconnect] $session: Enter (menu) → Down → Enter (reconnect)..."
         tmux send-keys -t "$session" Enter
         sleep 0.5
         tmux send-keys -t "$session" Down
@@ -193,17 +219,26 @@ reconnect_session() {
         tmux send-keys -t "$session" Enter
     fi
 
-    # Wait for actual reconnection signal in pane output
-    echo "[mcp-reconnect] $session: waiting for reconnection signal..."
-    for _w in $(seq 1 30); do
-        if tmux capture-pane -t "$session" -p 2>/dev/null | grep -q "Reconnected to"; then
+    # Step 5: Wait for reconnection
+    # Try signal-based wait first (look for "Reconnected to" in pane),
+    # fall back to fixed timer if signal not detected
+    echo "[mcp-reconnect] $session: waiting for reconnection..."
+    local reconnect_confirmed=0
+    for _w in $(seq 1 "$SETTLE_AFTER_SELECT"); do
+        if tmux capture-pane -t "$session" -p 2>/dev/null | grep -qi "Reconnected"; then
             echo "[mcp-reconnect] $session: reconnection confirmed"
+            reconnect_confirmed=1
             break
         fi
         sleep 1
     done
+    if [ $reconnect_confirmed -eq 0 ]; then
+        echo "[mcp-reconnect] $session: no reconnection signal — waited ${SETTLE_AFTER_SELECT}s (may still be OK)"
+    fi
 
+    # Step 6: Send continuation prompt
     echo "[mcp-reconnect] $session: sending continuation prompt..."
+    # Clear any stale input first (C-a = beginning of line, C-k = kill to end)
     tmux send-keys -t "$session" C-a C-k
     sleep 0.2
     tmux send-keys -t "$session" -l "$CONTINUATION_MSG"
@@ -262,6 +297,8 @@ tmux send-keys -t "$SESSION" Down
 sleep 0.3
 tmux send-keys -t "$SESSION" Enter
 sleep "$T_SEL"
+tmux send-keys -t "$SESSION" C-a C-k
+sleep 0.2
 tmux send-keys -t "$SESSION" -l "$MSG"
 sleep 0.3
 tmux send-keys -t "$SESSION" Enter
